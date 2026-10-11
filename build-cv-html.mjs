@@ -90,6 +90,19 @@ function escapeHtml(text) {
     .replace(/'/g, '&#39;');
 }
 
+// Escape user text for HTML, then convert `**bold**` spans to <strong> tags.
+// Used for free-form prose (summary, bullets, descriptions) where emphasising a
+// key metric is wanted. Escaping happens FIRST, so literal markup in the payload
+// is neutralised before the converter runs: `**` can only wrap already-safe text.
+// Braces are also encoded so a literal {{PLACEHOLDER}} in the text can never be
+// re-read as a template reference by fillEntry's later passes.
+function escapeRichText(text) {
+  return escapeHtml(text)
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\{/g, '&#123;')
+    .replace(/\}/g, '&#125;');
+}
+
 // Sanitize a URL for an href attribute: only allow the schemes the template's
 // contact row uses, coerce bare emails/domains, drop javascript:/data: and other
 // script-bearing schemes, then HTML-escape for the attribute context.
@@ -396,7 +409,7 @@ function buildExperience(entries, partial) {
   if (!partial) {
     return entries.filter(e => hasRequiredFields(e, 'experience', 'html')).map(e => {
       const bullets = Array.isArray(e.bullets)
-        ? e.bullets.filter(Boolean).map(b => `        <li>${escapeHtml(b)}</li>`).join('\n')
+        ? e.bullets.filter(Boolean).map(b => `        <li>${escapeRichText(b)}</li>`).join('\n')
         : '';
       const location = e.location
         ? `\n    <div class="job-location">${escapeHtml(e.location)}</div>`
@@ -420,7 +433,7 @@ ${bullets}
   const { entryTemplate, blocks } = partial;
   return entries.filter(e => hasRequiredFields(e, 'experience', 'html')).map(e => {
     const bullets = Array.isArray(e.bullets)
-      ? e.bullets.filter(Boolean).map(b => `<li>${escapeHtml(b)}</li>`).join('\n    ')
+      ? e.bullets.filter(Boolean).map(b => `<li>${escapeRichText(b)}</li>`).join('\n    ')
       : '';
     const blockValues = new Map([
       ['LOCATION_BLOCK', { value: escapeHtml(e.location || ''), present: Boolean(e.location) }],
@@ -454,7 +467,7 @@ function buildProjects(entries, partial) {
       const descText = e.description
         || (Array.isArray(e.bullets) ? e.bullets.filter(Boolean).join(' ') : '');
       const desc = descText
-        ? `\n    <div class="project-desc">${escapeHtml(descText)}</div>`
+        ? `\n    <div class="project-desc">${escapeRichText(descText)}</div>`
         : '';
       const tech = e.tech
         ? `\n    <div class="project-tech">${escapeHtml(e.tech)}</div>`
@@ -471,7 +484,7 @@ function buildProjects(entries, partial) {
       || (Array.isArray(e.bullets) ? e.bullets.filter(Boolean).join(' ') : '');
     const blockValues = new Map([
       ['BADGE_BLOCK', { value: escapeHtml(e.badge || ''), present: Boolean(e.badge) }],
-      ['DESC_BLOCK',  { value: escapeHtml(descText),      present: Boolean(descText) }],
+      ['DESC_BLOCK',  { value: escapeRichText(descText),  present: Boolean(descText) }],
       ['TECH_BLOCK',  { value: escapeHtml(e.tech || ''),  present: Boolean(e.tech) }],
     ]);
     const nameText = escapeHtml(e.name || '');
@@ -490,7 +503,7 @@ function buildProjects(entries, partial) {
       // The expanded block is scanned again by fillEntry, so encode braces in
       // the bullet text: a literal {{DESC}} must render as text, not be treated
       // as a template reference.
-      const literalBraces = (t) => escapeHtml(t).replace(/\{/g, '&#123;').replace(/\}/g, '&#125;');
+      const literalBraces = escapeRichText;
       const present = multi
         .map(b => descBlock.present.replace(/\{\{(DESC_BLOCK|DESC)\}\}/g, () => literalBraces(b)))
         .join('\n  ');
@@ -500,10 +513,20 @@ function buildProjects(entries, partial) {
     return fillEntry(entryTemplate, entryBlocks, {
       NAME:  nameHtml,
       BADGE: escapeHtml(e.badge || ''),
-      DESC:  escapeHtml(descText),
+      DESC:  escapeRichText(descText),
       TECH:  escapeHtml(e.tech || ''),
     }, blockValues);
   }).join('\n  ');
+}
+
+// Education detail: a `bullets` array renders as a list (one result per line);
+// otherwise a single `description` renders as before. Both honour **bold**.
+function eduDetailHtml(e) {
+  const bullets = Array.isArray(e.bullets) ? e.bullets.filter(Boolean) : [];
+  if (bullets.length > 0 && !e.description) {
+    return `<ul class="edu-bullets">\n${bullets.map(b => `      <li>${escapeRichText(b)}</li>`).join('\n')}\n    </ul>`;
+  }
+  return e.description ? `<div class="edu-desc">${escapeRichText(e.description)}</div>` : '';
 }
 
 function buildEducation(entries, partial) {
@@ -516,31 +539,40 @@ function buildEducation(entries, partial) {
       const location = e.location
         ? `\n    <div class="edu-location">${escapeHtml(e.location)}</div>`
         : '';
-      const desc = e.description
-        ? `\n    <div class="edu-desc">${escapeHtml(e.description)}</div>`
-        : '';
+      const desc = eduDetailHtml(e);
       return `<div class="edu-item">
     <div class="edu-header">
       <div class="edu-title">${escapeHtml(e.title)}${org}</div>
       <div class="edu-year">${escapeHtml(e.year || '')}</div>
-    </div>${location}${desc}
+    </div>${location}${desc ? `\n    ${desc}` : ''}
   </div>`;
     }).join('\n  ');
   }
 
   const { entryTemplate, blocks } = partial;
   return entries.filter(e => hasRequiredFields(e, 'education', 'html')).map(e => {
+    // A bullets array (no description) swaps the partial's DESC_BLOCK markup for
+    // a <ul class="edu-bullets">, one <li> per result.
+    const bullets = !e.description && Array.isArray(e.bullets) ? e.bullets.filter(Boolean) : [];
+    let entryBlocks = blocks;
+    if (bullets.length > 0 && blocks.get('DESC_BLOCK')) {
+      entryBlocks = new Map(blocks);
+      entryBlocks.set('DESC_BLOCK', {
+        ...blocks.get('DESC_BLOCK'),
+        present: `<ul class="edu-bullets">\n    ${bullets.map(b => `<li>${escapeRichText(b)}</li>`).join('\n    ')}\n  </ul>`,
+      });
+    }
     const blockValues = new Map([
-      ['ORG_BLOCK',      { value: escapeHtml(e.org || ''),         present: Boolean(e.org) }],
-      ['LOCATION_BLOCK', { value: escapeHtml(e.location || ''),    present: Boolean(e.location) }],
-      ['DESC_BLOCK',     { value: escapeHtml(e.description || ''), present: Boolean(e.description) }],
+      ['ORG_BLOCK',      { value: escapeHtml(e.org || ''),            present: Boolean(e.org) }],
+      ['LOCATION_BLOCK', { value: escapeHtml(e.location || ''),       present: Boolean(e.location) }],
+      ['DESC_BLOCK',     { value: escapeRichText(e.description || ''), present: Boolean(e.description) || bullets.length > 0 }],
     ]);
-    return fillEntry(entryTemplate, blocks, {
+    return fillEntry(entryTemplate, entryBlocks, {
       TITLE:    escapeHtml(e.title || ''),
       ORG:      escapeHtml(e.org || ''),
       LOCATION: escapeHtml(e.location || ''),
       YEAR:     escapeHtml(e.year || ''),
-      DESC:     escapeHtml(e.description || ''),
+      DESC:     escapeRichText(e.description || ''),
     }, blockValues);
   }).join('\n  ');
 }
@@ -719,7 +751,7 @@ function renderReport(payload, partials) {
     PAGE_WIDTH: pageWidth,
     NAME: escapeHtml(candidate.name || ''),
     SECTION_SUMMARY: escapeHtml(sectionTitles.summary),
-    SUMMARY_TEXT: escapeHtml(payload.summary || ''),
+    SUMMARY_TEXT: escapeRichText(payload.summary || ''),
     SECTION_COMPETENCIES: escapeHtml(sectionTitles.competencies),
     COMPETENCIES: buildCompetencies(payload.competencies, partials.get('competencies')),
     SECTION_EXPERIENCE: escapeHtml(sectionTitles.experience),
