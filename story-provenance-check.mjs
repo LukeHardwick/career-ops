@@ -154,13 +154,17 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { flagValue } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
+import { splitStoryBlocks, isValidStory, getField, STORY_FIELDS } from './lib/story-bank.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const DEFAULT_STORY_BANK_PATH = 'interview-prep/story-bank.md';
-const DEFAULT_CV_PATH = 'cv.md';
+const DATA_ROOT = getCareerOpsRoot();
+const DEFAULT_STORY_BANK_PATH = join(DATA_ROOT, 'interview-prep', 'story-bank.md');
+const DEFAULT_CV_PATH = join(DATA_ROOT, 'cv.md');
 
 // ── Numeric claim patterns ──────────────────────────────────────────
 // Each pattern extracts {kind, text, index, values}. `values` are the
@@ -221,35 +225,99 @@ const STOPWORDS = new Set([
 ]);
 
 // ── Story-bank parsing ──────────────────────────────────────────────
-// Same block shape match-star.mjs's parseStories() already relies on
-// (`### [Theme] Title` headers, `**Label:** value` lines) — reimplemented
-// narrowly here rather than imported, so this checker doesn't take on a
-// dependency on match-star.mjs's STAR-specific fields it doesn't need.
+// Splitting and validity come from lib/story-bank.mjs, the same definition
+// match-star.mjs and negotiation-roi.mjs use (#4514). What this checker adds
+// is coverage: it keeps EVERY block and every table row outside a block, not
+// only the valid stories, because a figure in a malformed entry is still a
+// figure in story-bank.md. Hiding it from the checker would hide exactly the
+// unverified numbers #2947 exists to surface. Invalid entries are flagged,
+// never dropped.
+
+/** First `**Provenance:**` value in `text`, lowercased, or null. */
+function provenanceIn(text) {
+  // The marker must open its own line (optional indent, at most one list or
+  // quote marker). A `**Provenance:**` quoted inside another field's value is
+  // story text, not the story's marker (issue #4819).
+  const m = text.match(/^[ \t]*(?:[-*+>][ \t]+)?\*\*Provenance:\*\*[ \t]*(.+)$/im);
+  return m ? m[1].trim().toLowerCase() : null;
+}
 
 /**
- * Parse story-bank.md into blocks with title, provenance marker, and body.
+ * Parse story-bank.md into checkable entries: every `### ` block, valid or
+ * not; every run of text a story was cut off from by a table or heading; and
+ * every table row outside a block. Each is attributed to itself, so a figure
+ * is never credited to a field it isn't in.
+ *
+ * Provenance is the exception, on purpose. A story and the text cut off from
+ * it are ONE unit for the marker, as they were before a story ended at a
+ * table or heading: a marker in either covers both. Otherwise a Result line
+ * that happens to sit below a table would lose its story's
+ * `user-cannot-confirm` and come back as derived-unverified, asking the user
+ * to confirm a figure they already said they can't (the decay AGENTS.md's
+ * confirmation invariant forbids). Table rows inherit only that denial, never
+ * `source:` or `user-stated`: rows after a story are often separate Block F
+ * rows, and a denial can only make a classification stricter.
+ *
  * @param {string} content
- * @returns {Array<{title: string, provenance: string|null, body: string}>}
+ * @returns {Array<{kind: 'story'|'trailing'|'table-row', title: string, provenance: string|null, body: string, valid: boolean, line: number, actionAfterCut?: string}>}
  */
 function parseStoryBlocks(content) {
-  const blocks = content.split(/^### /m).slice(1);
-  const stories = [];
+  const { blocks, tableRows, trailing } = splitStoryBlocks(content);
 
-  for (const block of blocks) {
-    const lines = block.trim().split('\n');
-    const header = lines[0].trim();
-    if (!header) continue;
+  // The story's own text first, then its cut-off runs in file order: the
+  // first marker found is the unit's, the same rule as reading the block whole.
+  const unitProvenance = blocks.map((b, i) => [b.raw, ...trailing.filter((t) => t.story === i).map((t) => t.text)]
+    .map(provenanceIn).find((p) => p) ?? null);
 
-    const themeMatch = header.match(/^\[([^\]]+)\]\s*(.+)/);
-    const title = themeMatch ? themeMatch[2].trim() : header;
+  const stories = blocks.map((b, i) => {
+    // An Action below the cut is why such a story reads as invalid; say so
+    // instead of "no Action", which sends the user looking for a missing line.
+    const cut = trailing.find((t) => t.story === i && getField(t.text, STORY_FIELDS.action));
+    return {
+      kind: 'story',
+      title: b.title || `(untitled, line ${b.line})`,
+      provenance: unitProvenance[i],
+      body: b.raw,
+      valid: isValidStory(b),
+      line: b.line,
+      ...(cut ? { actionAfterCut: cut.after } : {}),
+    };
+  });
 
-    const provMatch = block.match(/\*\*Provenance:\*\*\s*(.+)/i);
-    const provenance = provMatch ? provMatch[1].trim().toLowerCase() : null;
+  const cutOff = trailing.map((t) => ({
+    kind: 'trailing',
+    title: `(after ${t.after}, line ${t.line}) in "${stories[t.story].title}"`,
+    provenance: unitProvenance[t.story],
+    body: t.text,
+    valid: false,
+    line: t.line,
+    after: t.after,
+  }));
 
-    stories.push({ title, provenance, body: block });
-  }
+  const rows = tableRows.map((r) => ({
+    kind: 'table-row',
+    title: `(table row, line ${r.line}) ${r.label}`.trim(),
+    provenance: r.story >= 0 && unitProvenance[r.story] === 'user-cannot-confirm' ? 'user-cannot-confirm' : null,
+    body: r.text,
+    valid: false,
+    line: r.line,
+  }));
 
-  return stories;
+  return [...stories, ...cutOff, ...rows];
+}
+
+/**
+ * Entries the other readers cannot see, with why.
+ * @param {ReturnType<typeof parseStoryBlocks>} entries
+ */
+function malformedEntries(entries) {
+  const reason = (e) => {
+    if (e.kind === 'table-row') return 'table row: not a ### block';
+    if (e.kind === 'trailing') return `text after a ${e.after} inside a story: the readers stop at the ${e.after}`;
+    if (e.actionAfterCut) return `its **A (Action):** line comes after a ${e.actionAfterCut}, where the readers stop`;
+    return 'no **A (Action):** line';
+  };
+  return entries.filter((e) => !e.valid).map((e) => ({ title: e.title, kind: e.kind, line: e.line, reason: reason(e) }));
 }
 
 // ── Claim extraction ─────────────────────────────────────────────────
@@ -314,28 +382,112 @@ function buildCvNumberContexts(cvText) {
  * Content words (length >= 4, not a stopword, not itself a number) in a
  * window around a claim's position — the signal used for the
  * `supportedByResume` heuristic.
+ *
+ * The strip keeps letters, combining marks and digits of ANY script. It used
+ * to be `[^a-z0-9\s]`, which deletes every non-ASCII letter, and that broke
+ * this checker in both directions on a CV that is not written in ASCII:
+ *
+ *   - Cyrillic, Greek, Hebrew, Arabic, CJK — every character is stripped, the
+ *     window yields NO words at all, and an empty list makes both
+ *     hasScopedNumberMatch (`claimWords.includes`) and hasContextOverlap
+ *     (`words.some`) unconditionally false. So `existing` and
+ *     `supportedByResume` are unreachable and every claim the patterns do
+ *     extract lands in `derived-unverified` — including a figure sitting
+ *     verbatim in cv.md with matching context.
+ *   - Accented Latin — the strip does not just delete, it re-cuts the word:
+ *     "évaluation" becomes " valuation", a DIFFERENT real English word that
+ *     can then overlap cv.md prose that has nothing to do with the claim.
+ *     Shorter words vanish outright ("Größe", "naïve", "señor" all fall under
+ *     the length floor once split).
+ *
+ * That matters more here than in a grouping key. `derived-unverified` is what
+ * AGENTS.md's "Confirmation UX invariant" hands to the user to confirm or
+ * deny, and its stated risk is that a confirmed guess launders a guess into a
+ * verified fact. A checker that reports 100% unverified for a non-ASCII CV
+ * hands over a list where every entry is noise, which is how a user learns to
+ * confirm without reading.
+ *
+ * `\p{L}\p{M}\p{N}` is the alphabet tracker-parse.mjs's normalizeTextKey
+ * settled on for exactly this class of bug (#2393/#2429/#2569/#2666), down to
+ * keeping \p{M} so Indic matras survive. It is mirrored rather than imported:
+ * normalizeTextKey builds a solid identity KEY and this needs word boundaries
+ * preserved, and importing tracker-parse.mjs would make a story-bank check
+ * fail hard on a missing tracker-aliases.json it has no other use for.
+ *
  * @param {string} body
  * @param {number} matchIndex
  * @param {number} matchLength
  * @param {number} windowChars
  * @returns {string[]}
  */
+/**
+ * NFKC, lowercased, with the combining dot a lowercased Turkish `İ` leaves
+ * behind removed.
+ *
+ * Extracted so the two sides of every comparison below are folded IDENTICALLY.
+ * contextWords() folds the claim window; hasContextOverlap() searches cv.md.
+ * Folding only one of them is a bug that hides: a cv.md written "İstanbul"
+ * lowercases to `i` + U+0307 and stops matching a claim word the strip has
+ * already reduced to plain "istanbul".
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function foldForContext(text) {
+  return String(text ?? '')
+    // NFKC before the strip so a full-width "４０％" folds like "40%", the same
+    // normalization order normalizeTextKey uses.
+    .normalize('NFKC')
+    .toLowerCase()
+    // Lowercasing a Turkish dotted capital leaves a bare combining dot
+    // (U+0307) behind, and \p{M} in the strip below keeps it — so "İstanbul"
+    // and "Istanbul" would not compare equal. Same one-character strip, and
+    // the same reason, as normalizeTextKey's.
+    .replace(/\u0307/gu, '');
+}
+
 function contextWords(body, matchIndex, matchLength, windowChars = 90) {
   const start = Math.max(0, matchIndex - windowChars);
   const end = Math.min(body.length, matchIndex + matchLength + windowChars);
-  const snippet = body.slice(start, end).toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+  const snippet = foldForContext(body.slice(start, end))
+    .replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ');
   const words = snippet.split(/\s+/).filter(Boolean);
-  return [...new Set(words.filter((w) => w.length >= 4 && !STOPWORDS.has(w) && !/^\d+$/.test(w)))];
+  // `\p{N}` not `\d`: a token of Devanagari or full-width digits is just as
+  // much "a number, not a content word" as an ASCII one.
+  return [...new Set(words.filter((w) => w.length >= 4 && !STOPWORDS.has(w) && !/^\p{N}+$/u.test(w)))];
 }
 
 /**
- * Whether any context word appears (word-boundary, case-insensitive) in cv.md prose.
- * @param {string[]} words
- * @param {string} cvTextLower
+ * Whether any context word appears, on a word boundary, in cv.md prose.
+ *
+ * The boundary is a lookaround pair, not `\b`. `\b` is defined against `\w`,
+ * which is `[A-Za-z0-9_]` — so for a Cyrillic, Greek, Hebrew, Arabic or CJK
+ * word BOTH sides of every edge are non-word characters and the assertion is
+ * never satisfied:
+ *
+ *   /\bсократил\b/i.test('сократил расходы')   ->  false
+ *
+ * That made this the second half of the same defect as the ASCII strip in
+ * contextWords: even once the words survive folding, they could never be found
+ * in cv.md, so `supportedByResume` stayed unreachable for a non-Latin CV and
+ * every claim still fell to `derived-unverified`.
+ *
+ * Mirrors the `bounded()` helper scan.mjs already uses for company names, down
+ * to its escape set — `\-` is an invalid identity escape under `u`. Both
+ * operands here are folded output (letters, marks, digits and spaces only), so
+ * the escape is defensive rather than load-bearing.
+ *
+ * @param {string[]} words - Claim context words, already folded.
+ * @param {string} cvText - Raw cv.md; folded here so both sides match.
  * @returns {boolean}
  */
-function hasContextOverlap(words, cvTextLower) {
-  return words.some((w) => new RegExp(`\\b${w}\\b`, 'i').test(cvTextLower));
+function hasContextOverlap(words, cvText) {
+  const haystack = foldForContext(cvText);
+  const bounded = (w) => new RegExp(
+    `(?<![\\p{L}\\p{M}\\p{N}])${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\p{L}\\p{M}\\p{N}])`,
+    'u',
+  );
+  return words.some((w) => bounded(w).test(haystack));
 }
 
 /**
@@ -364,7 +516,6 @@ const USER_STATED_RE = /^user-stated\s+\d{4}-\d{2}-\d{2}$/;
  */
 function classifyStoryBank(storyBankText, cvText) {
   const cvNumberContexts = buildCvNumberContexts(cvText);
-  const cvTextLower = cvText.toLowerCase();
   const stories = parseStoryBlocks(storyBankText);
 
   const buckets = { existing: [], supportedByResume: [], derivedUnverified: [], userCannotConfirm: [] };
@@ -419,7 +570,7 @@ function classifyStoryBank(storyBankText, cvText) {
         continue;
       }
 
-      if (hasContextOverlap(claimWords, cvTextLower)) {
+      if (hasContextOverlap(claimWords, cvText)) {
         buckets.supportedByResume.push({ ...entry, contextWords: claimWords });
         continue;
       }
@@ -463,7 +614,7 @@ function diagnose(storyBankExists, cvExists, storyCount, claimCount, storyBankPa
 }
 
 // ── Exports (for test-all.mjs and other consumers) ───────────────────
-export { parseStoryBlocks, extractClaims, extractNumbers, classifyStoryBank, diagnose };
+export { parseStoryBlocks, malformedEntries, extractClaims, extractNumbers, classifyStoryBank, diagnose };
 
 // ── CLI ──────────────────────────────────────────────────────────────
 
@@ -706,7 +857,7 @@ Brings 15 years of unrelated professional background in adult education prior to
 
 // ── Main ─────────────────────────────────────────────────────────────
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url)) {
   if (selfTestMode) {
     runSelfTest();
   } else {
@@ -716,7 +867,13 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const cvText = cvExists ? readFileSync(cvPath, 'utf-8') : '';
 
     const result = classifyStoryBank(storyBankText, cvText);
-    const storyCount = storyBankExists ? parseStoryBlocks(storyBankText).length : 0;
+    const entries = storyBankExists ? parseStoryBlocks(storyBankText) : [];
+    // Every `### ` block counts, valid or not: this checker did parse them and
+    // did check their figures. A missing Action is reported in `malformed`,
+    // not as "no stories parsed". Table rows don't count, so a bank of nothing
+    // but table rows is still a low-confidence result.
+    const storyCount = entries.filter((e) => e.kind === 'story').length;
+    const malformed = malformedEntries(entries);
     const claimCount = result.existing.length + result.supportedByResume.length
       + result.derivedUnverified.length + result.userCannotConfirm.length;
     const diagnosis = diagnose(storyBankExists, cvExists, storyCount, claimCount, storyBankPath, cvPath);
@@ -739,6 +896,13 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       printBucket('derived-unverified (only in story-bank.md, unconfirmed)', '⚠️', result.derivedUnverified);
       printBucket('user-cannot-confirm (explicitly marked, durable)', '🔒', result.userCannotConfirm);
 
+      if (malformed.length) {
+        console.log('');
+        console.log(`  🧩 malformed — invisible to npm run star / negotiation-roi (${malformed.length})`);
+        for (const m of malformed) console.log(`     - ${m.title} — ${m.reason}`);
+        console.log('     Convert to the format in templates/story-bank.template.md.');
+      }
+
       if (diagnosis) {
         console.log('');
         console.log('  🚨 LOW CONFIDENCE: this is not a clean result.');
@@ -746,7 +910,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
         console.log(`     (reason: ${diagnosis.reason})`);
       }
     } else {
-      console.log(JSON.stringify({ ...result, lowConfidence: diagnosis }, null, 2));
+      console.log(JSON.stringify({ ...result, malformed, lowConfidence: diagnosis }, null, 2));
     }
   }
 }
